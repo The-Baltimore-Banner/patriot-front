@@ -1,0 +1,324 @@
+---
+title: "fact-check"
+output: html_document
+date: "2022-11-17"
+---
+
+```{r}
+
+library(tidyverse)
+library(gsheet)
+library(janitor)
+library(lubridate)
+library(tis)
+library(readxl)
+library(corrr)
+library(tidygeocoder)
+options(digits=6)
+options(scipen=999)
+
+#does a standard group_by and count() with percentage
+grouper <- function(input_df, group_by_column, new_column_name = "n()"){
+  output_df <- input_df %>%
+    group_by(.data[[group_by_column]]) %>%
+    summarise(temp_count = n()) %>%
+    mutate(percent = temp_count/sum(temp_count)*100) %>%
+    arrange(desc(percent)) %>%
+    rename(!!new_column_name := temp_count)
+  return(output_df)
+}
+
+#group/counts every column in input dataframe
+group_count <- function(input_df, group_column_name='n', state_filter=NA, start_col = 1){
+  column_names <- colnames(input_df)
+  if(!is.na(state_filter)){
+    input_df <- input_df %>%
+      filter(state == state_filter)
+  }
+  for (column in column_names[start_col:length(column_names)]){
+    output <- grouper(input_df, column, group_column_name)
+    print(output)
+  }
+}
+
+#lowers case of every character column in a dataframe
+lower_df <- function(input_df){
+  names <- colnames(input_df)
+  output_df <- input_df
+  names <- colnames(output_df)
+  for (name in names){
+    if (is.character(output_df[[name]])){
+      output_df[[name]] <- tolower(output_df[[name]])
+      #print('yes')
+    } else {
+      output_df[[name]] <- output_df[[name]]
+      #print('no')
+    }
+  }
+  return(output_df)
+}
+
+grouper_sum <- function(input_df, group_by_column, sum_column, new_column_name = "n"){
+  output_df <- input_df %>%
+    group_by(.data[[group_by_column]]) %>%
+    summarise(temp_count = sum(.data[[sum_column]], na.rm = TRUE)) %>%
+    mutate(percent = temp_count/sum(temp_count, na.rm = TRUE)*100) %>%
+    arrange(desc(percent)) %>%
+    rename(!!new_column_name := temp_count)
+  return(output_df)
+  
+}
+
+```
+
+## IMPORT
+
+```{R}
+
+#building holidays list from tis
+holiday_list <- holidays(c(2020, 2021, 2022))
+
+#adjusting format
+holiday_list <- as.Date(as.character(holiday_list), format = "%Y%m%d")
+
+patriot_front_import <- gsheet2tbl("https://docs.google.com/spreadsheets/d/14_eJUAXRj2p-CvOh5j7D9AdiAVVlMb-wuOz-N09M2wY/edit#gid=0") %>%
+  clean_names() %>%
+  select(post_date, location, flyer_count, link) %>%
+  mutate(post_date = mdy(post_date)) %>%
+  mutate(month = month(post_date),
+         year = year(post_date),
+         day = wday(post_date, label = TRUE),
+         holiday = case_when(
+           post_date %in% holiday_list ~ TRUE,
+           TRUE ~ FALSE
+         )) %>%
+  separate(location, c("city", "state"), ", ") %>%
+  filter(state == "Maryland") %>%
+  mutate(flyer_count = case_when(
+    flyer_count == "0" ~ "1",
+    TRUE ~flyer_count
+  )) %>%
+  mutate(flyer_count = as.numeric(flyer_count)) 
+
+votes <- read_csv("data/countypres_2000-2020.csv") %>%
+  #building dataset of maryland counties by dem and rep vote share in 2020 presidential
+  filter(state == "MARYLAND",
+         year == 2020,
+         party %in% c("DEMOCRAT", "REPUBLICAN")) %>%
+  clean_names() %>%
+  lower_df() %>%
+  #adding all vote types together
+  group_by(county_name, party) %>%
+  summarise(votes = sum(candidatevotes),
+            total_votes = as.numeric(paste0(unique(totalvotes)))) %>%
+  #calculating vote share
+  mutate(vote_share = round((votes/total_votes)*100, 1)) %>%
+  select(-votes, -total_votes) %>%
+  pivot_wider(values_from = vote_share, names_from = party)
+
+scraped_cities <- read_csv("data/city-counties-db.csv") %>%
+  distinct(city, county, .keep_all = TRUE) %>%
+  mutate(county = case_when(
+    county == "Caroll" ~ "Carroll",
+    TRUE ~ county
+  ))
+
+patriot_front <- patriot_front_import %>%
+  left_join(scraped_cities) %>%
+  mutate(city = case_when(
+    is.na(fixed_spelling) == FALSE ~ fixed_spelling,
+    TRUE ~ city
+  )) %>%
+  mutate(county = case_when(
+    county == "Baltimore" ~ "Baltimore County",
+    county == "None (Independent city)" ~ "Baltimore City",
+    TRUE ~ county
+  )) %>%
+  mutate(city = case_when(
+    fixed_spelling != "NA" ~ fixed_spelling,
+    city == "Baltimore City" ~ "Baltimore",
+    city == "Brookville" ~ "Brookeville",
+    city == "Elicot City" ~ "Ellicott City",
+    city == "Ellicot City" ~ "Ellicott City",
+    city == "McDaniel College in Westminster" ~ "Westminster",
+    city == "Reistertown" ~ "Reisterstown",
+    city == "Silver Springs" ~ "Silver Spring",
+    city == "University of Maryland in College Park" ~ "College Park",
+    city == "Wheaton-Glenmont" ~ "Wheaton",
+    TRUE ~ city
+  )) %>%
+  mutate(no_id = case_when(
+    is.na(county) ~ TRUE,
+    TRUE ~ FALSE
+  )) %>%
+  select(-fixed_spelling, -college)
+
+```
+
+## GEOCODE
+
+```{r}
+
+#cities <- patriot_front %>%
+#  group_by(city, county) %>%
+#  summarise(flyers = sum(flyer_count)) %>%
+#  mutate(state = "Maryland")
+#
+#
+#geocoded_cities <- geocode(cities, city = city, county = county, state = state)
+#
+#success_geocodes <- geocoded_cities %>%
+#  filter(!is.na(county),
+#         !is.na(lat))
+#
+#failed_geocodes <- geocoded_cities %>%
+#  filter(!is.na(county)) %>%
+#  filter(is.na(lat)) %>%
+#  select(-lat, -long)
+#
+#attempt_2 <- geocode(failed_geocodes, city = city, state = state)
+#
+#success_geocodes <- success_geocodes %>%
+#  bind_rows(attempt_2 %>%
+#              filter(!is.na(lat)))
+#
+#success_geocodes <- success_geocodes %>%
+#  bind_rows(attempt_2 %>%
+#              filter(is.na(lat)) %>%
+#              mutate(lat =case_when(
+#                city == "Suitland-Silver Hill" ~ 38.8476,
+#                TRUE ~ lat
+#              )) %>%
+#              mutate(long =case_when(
+#                city == "Suitland-Silver Hill" ~ -76.9246,
+#                TRUE ~ long
+#              )) %>%
+#              filter(city != "Burnsville")) %>%
+#  arrange(city)
+
+#write_csv(success_geocodes, "data/output/successful-geocodes.csv")
+
+success_geocodes <- read_csv("data/output/successful-geocodes.csv")
+
+master <- patriot_front %>%
+  left_join(success_geocodes)
+
+```
+
+### FACTCHECK
+
+"According to a Baltimore Banner analysis, white nationalist organization Patriot Front has put up thousands of stickers, graffiti, and banners in communities across the country, including in Maryland, since the beginning of 2020."
+
+```{r}
+
+sum(master$flyer_count, na.rm = TRUE)
+
+```
+
+"The analysis of two Patriot Front channels found more than 500 posts claiming to show the dissemination of 2,407 stickers, banners and flyers throughout Maryland since the beginning of 2020."
+
+```{r}
+
+patriot_front %>%
+  group_by(post_date, city, state) %>%
+  summarise(posts = sum(flyer_count)) %>%
+  arrange(desc(posts)) %>%
+  ungroup() %>%
+  group_by(n()) %>%
+  summarise(posts = sum(posts, na.rm = TRUE))
+  
+
+```
+
+"A review of these Telegram posts found that the group initially targeted more conservative Maryland counties and then, in August 2021, switched their focus to liberal counties in the Washington and Baltimore metro areas."
+
+```{r}
+
+master_party <- patriot_front %>%
+  full_join(votes %>%
+              rename(county = county_name) %>%
+              mutate(county = case_when(
+              county == "st mary's" ~ "st. mary's",
+              county == "baltimore" ~ "baltimore county",
+              TRUE ~ county)) %>%
+              mutate(county = str_to_title(county))
+            ) %>%
+  filter(!is.na(county),
+         county != "Multiple locations") %>%
+  mutate(party = case_when(
+    democrat > republican ~ "Democrat",
+    republican > democrat ~ "Republican",
+    TRUE ~ "NA"
+  )) %>%
+  mutate(difference = abs(democrat - republican)) %>%
+  mutate(county_party_color = case_when(
+    party == "Democrat" & difference >= 10 ~ "blue",
+    party == "Republican" & difference >= 10 ~ "red",
+    TRUE ~ "purple"
+  ))
+
+flyers_by_county_party_over_time <- master_party %>%
+  group_by(county_party_color, year, month) %>%
+  summarise(flyers = sum(flyer_count, na.rm = TRUE)) %>%
+  mutate(date = paste0(year, "/", month)) %>%
+  ungroup() %>%
+  select(county_party_color, date, flyers) %>%
+  pivot_wider(values_from = flyers, names_from = county_party_color)
+
+flyers_by_county_party_over_time[is.na(flyers_by_county_party_over_time)] <- 0
+
+flyers_by_county_party_over_time
+
+```
+
+"Patriot Front posted two out of every three flyers, stickers, or banners between 2020 and October 2022 in a county that voted for President Joe Biden in the 2020 presidential election."
+
+```{r}
+
+grouper_sum(master_party, "party", "flyer_count", "flyers")
+
+```
+
+"Though Patriot Front appears to still be focusing on liberal counties, the number of stickers and flyers posted has plummeted. No county has had more than 20 posts in a month since April 2022, a number far lower than the peak of 120 posted in Montgomery County in October 2021."
+
+```{r}
+
+flyers_by_county_by_month <- patriot_front %>%
+    lower_df() %>%
+    mutate(county = case_when(
+      county == "baltimore county" ~ "baltimore",
+      TRUE ~ county
+    )) %>%
+    group_by(county, month, year) %>%
+    summarise(flyers = sum(flyer_count)) %>%
+    mutate(county = case_when(
+      is.na(county) == TRUE ~ "unidentified county",
+      county == "NA" ~ "unidentified county",
+      TRUE ~ county
+    )) %>%
+    arrange(county, desc(year), desc(month))
+
+flyers_by_county_by_month %>%
+  filter(month %in% c(6, 7, 8),
+        year == 2022) %>%
+  arrange(desc(flyers))
+
+```
+
+"Still, Patriot Front members posted hundreds of flyers in Baltimore City and Montgomery, Carroll, and Baltimore counties in the first quarter of 2022.
+
+```{r}
+
+flyers_by_county_by_month %>%
+  filter(month %in% c(1, 2, 3, 4),
+        year == 2022) %>%
+  arrange(desc(flyers)) %>%
+  adorn_totals("row")
+
+```
+
+
+
+
+
+
